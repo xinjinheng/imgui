@@ -87,6 +87,14 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
+// Accessibility (UIA) support
+#if !defined(IMGUI_DISABLE_ACCESSIBILITY)
+#ifndef _UIAUTOMATION_H_
+#include <UIAutomation.h>
+#endif
+#endif
+
 #include <windowsx.h> // GET_X_LPARAM(), GET_Y_LPARAM()
 #include <tchar.h>
 #include <dwmapi.h>
@@ -130,6 +138,47 @@ struct ImGui_ImplWin32_Data
 
     ImGui_ImplWin32_Data()      { memset((void*)this, 0, sizeof(*this)); }
 };
+
+// Accessibility (UIA) data
+#if !defined(IMGUI_DISABLE_ACCESSIBILITY)
+struct ImGui_ImplWin32_Accessibility
+{
+    HWND                        Window;
+    LONG                        RefCount;
+    
+    // UIA interfaces
+    IUnknown*                   Unknown;
+    IRawElementProviderSimple*  RawElementProvider;
+    IRawElementProviderFragment* FragmentProvider;
+    IRawElementProviderFragmentRoot* FragmentRootProvider;
+    IValueProvider*             ValueProvider;
+    IRangeValueProvider*        RangeValueProvider;
+    ISelectionItemProvider*     SelectionItemProvider;
+    ISelectionProvider*         SelectionProvider;
+    IInvokeProvider*            InvokeProvider;
+    IToggleProvider*            ToggleProvider;
+    
+    // Current accessible focus
+    ImGuiID                     FocusedId;
+    ImGuiWindow*                FocusedWindow;
+    
+    ImGui_ImplWin32_Accessibility()
+        : Window(nullptr), RefCount(1)
+        , Unknown(nullptr), RawElementProvider(nullptr), FragmentProvider(nullptr), FragmentRootProvider(nullptr)
+        , ValueProvider(nullptr), RangeValueProvider(nullptr), SelectionItemProvider(nullptr), SelectionProvider(nullptr)
+        , InvokeProvider(nullptr), ToggleProvider(nullptr)
+        , FocusedId(0), FocusedWindow(nullptr)
+    {}
+};
+
+static ImGui_ImplWin32_Accessibility* g_Accessibility = nullptr;
+
+// Accessibility helper functions
+static void ImGui_ImplWin32_Accessibility_Init(HWND hwnd);
+static void ImGui_ImplWin32_Accessibility_Shutdown();
+static void ImGui_ImplWin32_Accessibility_Update();
+static void ImGui_ImplWin32_Accessibility_NotifyEvent(EVENTID eventId, LONG idObject, LONG idChild);
+#endif
 
 // Backend data stored in io.BackendPlatformUserData to allow support for multiple Dear ImGui contexts
 // It is STRONGLY preferred that you use docking branch with multi-viewports (== single Dear ImGui context + multiple windows) instead of multiple Dear ImGui contexts.
@@ -185,6 +234,11 @@ static bool ImGui_ImplWin32_InitEx(void* hwnd, bool platform_has_own_dc)
     main_viewport->PlatformHandle = main_viewport->PlatformHandleRaw = (void*)bd->hWnd;
     IM_UNUSED(platform_has_own_dc); // Used in 'docking' branch
 
+    // Initialize accessibility (UIA) support
+#if !defined(IMGUI_DISABLE_ACCESSIBILITY)
+    ImGui_ImplWin32_Accessibility_Init((HWND)hwnd);
+#endif
+
     // Dynamically load XInput library
 #ifndef IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
     bd->WantUpdateHasGamepad = true;
@@ -232,6 +286,11 @@ void    ImGui_ImplWin32_Shutdown()
     if (bd->XInputDLL)
         ::FreeLibrary(bd->XInputDLL);
 #endif // IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+
+    // Shutdown accessibility (UIA) support
+#if !defined(IMGUI_DISABLE_ACCESSIBILITY)
+    ImGui_ImplWin32_Accessibility_Shutdown();
+#endif
 
     io.BackendPlatformName = nullptr;
     io.BackendPlatformUserData = nullptr;
@@ -422,6 +481,11 @@ void    ImGui_ImplWin32_NewFrame()
         bd->LastMouseCursor = mouse_cursor;
         ImGui_ImplWin32_UpdateMouseCursor(io, mouse_cursor);
     }
+
+    // Update accessibility (UIA) state
+#if !defined(IMGUI_DISABLE_ACCESSIBILITY)
+    ImGui_ImplWin32_Accessibility_Update();
+#endif
 
     // Update game controllers (if enabled and available)
     ImGui_ImplWin32_UpdateGamepads(io);
@@ -630,6 +694,17 @@ IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandlerEx(HWND hwnd, UINT msg, WPA
     ImGui_ImplWin32_Data* bd = ImGui_ImplWin32_GetBackendData(io);
     if (bd == nullptr)
         return 0;
+
+    // Pass accessibility-related messages to our custom handler
+    #ifdef IMGUI_IMPL_WIN32_ACCESSIBILITY
+    if (msg == WM_GETOBJECT || msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
+    {
+        LRESULT result = ImGui_ImplWin32_WndProcHandler_Accessibility(hwnd, msg, wParam, lParam);
+        if (result != 0)
+            return result;
+    }
+    #endif
+
     switch (msg)
     {
     case WM_MOUSEMOVE:
@@ -963,6 +1038,431 @@ void ImGui_ImplWin32_EnableAlphaCompositing(void* hwnd)
 }
 
 //---------------------------------------------------------------------------------------------------------
+
+// Accessibility (UIA) implementation
+#if !defined(IMGUI_DISABLE_ACCESSIBILITY)
+
+// COM interface implementation helper
+#define COM_INTERFACE_IMPL(iface) \
+    virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override; \
+    virtual ULONG STDMETHODCALLTYPE AddRef() override; \
+    virtual ULONG STDMETHODCALLTYPE Release() override; \
+    virtual HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal) override; \
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal) override; \
+    virtual IRawElementProviderSimple* STDMETHODCALLTYPE GetHostRawElementProvider() override;
+
+// UIA provider class
+class ImGuiUiaProvider : public IRawElementProviderSimple, public IRawElementProviderFragmentRoot
+{
+public:
+    COM_INTERFACE_IMPL(IRawElementProviderSimple);
+    
+    // IRawElementProviderFragmentRoot methods
+    virtual HRESULT STDMETHODCALLTYPE ElementProviderFromPoint(double x, double y, IRawElementProviderFragment** pRetVal) override;
+    virtual HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment** pRetVal) override;
+    
+    ImGuiUiaProvider(HWND hwnd);
+    ~ImGuiUiaProvider();
+    
+    // Helper methods for accessibility notifications
+    void NotifyElementFocused();
+    void NotifyElementFocusLost();
+    
+private:
+    HWND m_hwnd;
+    LONG m_refCount;
+};
+
+ImGuiUiaProvider::ImGuiUiaProvider(HWND hwnd)
+    : m_hwnd(hwnd), m_refCount(1)
+{
+    CoInitialize(nullptr);
+}
+
+ImGuiUiaProvider::~ImGuiUiaProvider()
+{
+    CoUninitialize();
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::QueryInterface(REFIID riid, void** ppvObject)
+{
+    if (ppvObject == nullptr)
+        return E_INVALIDARG;
+    
+    *ppvObject = nullptr;
+    
+    if (IsEqualIID(riid, IID_IUnknown))
+        *ppvObject = static_cast<IUnknown*>(this);
+    else if (IsEqualIID(riid, IID_IRawElementProviderSimple))
+        *ppvObject = static_cast<IRawElementProviderSimple*>(this);
+    else if (IsEqualIID(riid, IID_IRawElementProviderFragment))
+        *ppvObject = static_cast<IRawElementProviderFragment*>(this);
+    else if (IsEqualIID(riid, IID_IRawElementProviderFragmentRoot))
+        *ppvObject = static_cast<IRawElementProviderFragmentRoot*>(this);
+    
+    if (*ppvObject != nullptr)
+    {
+        AddRef();
+        return S_OK;
+    }
+    
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE ImGuiUiaProvider::AddRef()
+{
+    return InterlockedIncrement(&m_refCount);
+}
+
+ULONG STDMETHODCALLTYPE ImGuiUiaProvider::Release()
+{
+    LONG refCount = InterlockedDecrement(&m_refCount);
+    if (refCount == 0)
+        delete this;
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal)
+{
+    *pRetVal = nullptr;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal)
+{
+    VariantInit(pRetVal);
+    
+    switch (propertyId)
+    {
+    case UIA_NamePropertyId:
+        pRetVal->vt = VT_BSTR;
+        pRetVal->bstrVal = SysAllocString(L"ImGui Window");
+        break;
+    case UIA_RolePropertyId:
+        pRetVal->vt = VT_I4;
+        pRetVal->lVal = UiaCore::Window;
+        break;
+    case UIA_ControlTypePropertyId:
+        pRetVal->vt = VT_I4;
+        pRetVal->lVal = UIA_WindowControlTypeId;
+        break;
+    case UIA_BoundingRectanglePropertyId:
+        RECT rect;
+        GetWindowRect(m_hwnd, &rect);
+        UiaCore::Rect uiaRect;
+        uiaRect.left = rect.left;
+        uiaRect.top = rect.top;
+        uiaRect.width = rect.right - rect.left;
+        uiaRect.height = rect.bottom - rect.top;
+        pRetVal->vt = VT_DISPATCH;
+        // Note: Need to implement a Rect wrapper class to return here
+        break;
+    case UIA_IsKeyboardFocusablePropertyId:
+        pRetVal->vt = VT_BOOL;
+        pRetVal->boolVal = VARIANT_TRUE;
+        break;
+    case UIA_HasKeyboardFocusPropertyId:
+        pRetVal->vt = VT_BOOL;
+        pRetVal->boolVal = (GetFocus() == m_hwnd) ? VARIANT_TRUE : VARIANT_FALSE;
+        break;
+    default:
+        pRetVal->vt = VT_EMPTY;
+        break;
+    }
+    
+    return S_OK;
+}
+
+IRawElementProviderSimple* STDMETHODCALLTYPE ImGuiUiaProvider::GetHostRawElementProvider()
+{
+    return nullptr; // We are the host
+}
+
+// IRawElementProviderFragment methods (empty implementation for root)
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::ElementProviderFromPoint(double x, double y, IRawElementProviderFragment** pRetVal)
+{
+    *pRetVal = nullptr;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::GetFocus(IRawElementProviderFragment** pRetVal)
+{
+    if (pRetVal == nullptr)
+        return E_INVALIDARG;
+
+    *pRetVal = nullptr;
+    // Return focus to the current ImGui window or control
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse || io.WantCaptureKeyboard)
+    {
+        // If ImGui is handling input, return ourself as the focused element
+        AddRef();
+        *pRetVal = this;
+        return S_OK;
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal)
+{
+    if (pRetVal == nullptr)
+        return E_INVALIDARG;
+
+    *pRetVal = nullptr;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal)
+{
+    if (pRetVal == nullptr)
+        return E_INVALIDARG;
+
+    VariantInit(pRetVal);
+
+    switch (propertyId)
+    {
+        case UIA_NamePropertyId:
+        {
+            // Set a default name for the ImGui window
+            BSTR bstrName = SysAllocString(L"ImGui Application");
+            if (bstrName != nullptr)
+            {
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = bstrName;
+            }
+            break;
+        }
+        case UIA_ControlTypePropertyId:
+        {
+            pRetVal->vt = VT_I4;
+            pRetVal->lVal = UIA_WindowControlTypeId;
+            break;
+        }
+        case UIA_IsKeyboardFocusablePropertyId:
+        {
+            pRetVal->vt = VT_BOOL;
+            pRetVal->boolVal = VARIANT_TRUE;
+            break;
+        }
+        case UIA_HasKeyboardFocusPropertyId:
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            pRetVal->vt = VT_BOOL;
+            pRetVal->boolVal = (io.WantCaptureKeyboard) ? VARIANT_TRUE : VARIANT_FALSE;
+            break;
+        }
+        case UIA_BoundingRectanglePropertyId:
+        {
+            // Get the main window rectangle
+            RECT rect;
+            if (::GetWindowRect(m_hwnd, &rect))
+            {
+                UiaRect uiaRect;
+                uiaRect.left = rect.left;
+                uiaRect.top = rect.top;
+                uiaRect.width = rect.right - rect.left;
+                uiaRect.height = rect.bottom - rect.top;
+                pRetVal->vt = VT_RECORD;
+                pRetVal->pvarVal = reinterpret_cast<PVOID>(&uiaRect);
+                pRetVal->pvRecord = nullptr;
+            }
+            break;
+        }
+        case UIA_AutomationIdPropertyId:
+        {
+            // Set a default automation ID for the ImGui window
+            BSTR bstrAutomationId = SysAllocString(L"ImGuiApplication");
+            if (bstrAutomationId != nullptr)
+            {
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = bstrAutomationId;
+            }
+            break;
+        }
+        case UIA_IsEnabledPropertyId:
+        {
+            // ImGui applications are always enabled
+            pRetVal->vt = VT_BOOL;
+            pRetVal->boolVal = VARIANT_TRUE;
+            break;
+        }
+        case UIA_IsContentElementPropertyId:
+        {
+            // This is a content element
+            pRetVal->vt = VT_BOOL;
+            pRetVal->boolVal = VARIANT_TRUE;
+            break;
+        }
+        case UIA_IsControlElementPropertyId:
+        {
+            // This is a control element
+            pRetVal->vt = VT_BOOL;
+            pRetVal->boolVal = VARIANT_TRUE;
+            break;
+        }
+        case UIA_ProcessIdPropertyId:
+        {
+            // Get the process ID
+            pRetVal->vt = VT_I4;
+            pRetVal->lVal = ::GetCurrentProcessId();
+            break;
+        }
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ImGuiUiaProvider::get_HostRawElementProvider(IRawElementProviderSimple** pRetVal)
+{
+    if (pRetVal == nullptr)
+        return E_INVALIDARG;
+
+    *pRetVal = nullptr;
+    // Return the underlying window's provider
+    return ::UiaHostProviderFromHwnd(m_hwnd, pRetVal);
+}
+
+void ImGuiUiaProvider::NotifyElementFocused()
+{
+    // Notify UI Automation that the element has received focus
+    IRawElementProviderSimple* pProvider = nullptr;
+    QueryInterface(IID_IRawElementProviderSimple, (void**)&pProvider);
+    if (pProvider != nullptr)
+    {
+        ::UiaRaiseAutomationEvent(pProvider, UIA_AutomationFocusChangedEventId);
+        pProvider->Release();
+    }
+}
+
+void ImGuiUiaProvider::NotifyElementFocusLost()
+{
+    // Notify UI Automation that the element has lost focus
+    IRawElementProviderSimple* pProvider = nullptr;
+    QueryInterface(IID_IRawElementProviderSimple, (void**)&pProvider);
+    if (pProvider != nullptr)
+    {
+        // We don't raise a separate event for focus lost; focus changed event covers it
+        pProvider->Release();
+    }
+}
+
+static ImGuiUiaProvider* g_pUiaProvider = nullptr;
+static WNDPROC g_OriginalWndProc = nullptr;
+
+// Accessibility helper functions
+static LRESULT CALLBACK ImGui_ImplWin32_WndProcHandler_Accessibility(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    // Handle WM_GETOBJECT message for UI Automation
+    if (msg == WM_GETOBJECT && (DWORD)lParam == UiaRootObjectId)
+    {
+        if (g_pUiaProvider == nullptr)
+            g_pUiaProvider = new ImGuiUiaProvider(hwnd);
+            
+        IRawElementProviderSimple* pProvider;
+        HRESULT hr = g_pUiaProvider->QueryInterface(IID_IRawElementProviderSimple, (void**)&pProvider);
+        if (SUCCEEDED(hr))
+        {
+            LRESULT result = UiaReturnRawElementProvider(hwnd, wParam, lParam, pProvider);
+            pProvider->Release();
+            return result;
+        }
+    }
+    // Handle other accessibility-related messages
+    else if (msg == WM_SETFOCUS)
+    {
+        // Notify UI Automation that focus has been set
+        if (g_pUiaProvider != nullptr)
+            g_pUiaProvider->NotifyElementFocused();
+    }
+    else if (msg == WM_KILLFOCUS)
+    {
+        // Notify UI Automation that focus has been lost
+        if (g_pUiaProvider != nullptr)
+            g_pUiaProvider->NotifyElementFocusLost();
+    }
+
+    // Pass unhandled messages to the original window procedure
+    if (g_OriginalWndProc != nullptr)
+        return CallWindowProc(g_OriginalWndProc, hwnd, msg, wParam, lParam);
+
+    return 0;
+}
+
+static void ImGui_ImplWin32_Accessibility_Init(HWND hwnd)
+{
+    if (g_Accessibility != nullptr)
+        return;
+
+    // Allocate accessibility data
+    g_Accessibility = IM_NEW(ImGui_ImplWin32_Accessibility)();
+    g_Accessibility->Window = hwnd;
+
+    // Subclass the window to handle accessibility messages
+    g_OriginalWndProc = (WNDPROC)::SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)ImGui_ImplWin32_WndProcHandler_Accessibility);
+}
+
+static void ImGui_ImplWin32_Accessibility_Shutdown()
+{
+    if (g_Accessibility == nullptr)
+        return;
+
+    // Restore the original window procedure
+    if (g_OriginalWndProc != nullptr && g_Accessibility->Window != nullptr)
+    {
+        ::SetWindowLongPtr(g_Accessibility->Window, GWLP_WNDPROC, (LONG_PTR)g_OriginalWndProc);
+        g_OriginalWndProc = nullptr;
+    }
+
+    // Clean up UIA provider
+    if (g_pUiaProvider != nullptr)
+    {
+        g_pUiaProvider->Release();
+        g_pUiaProvider = nullptr;
+    }
+
+    IM_DELETE(g_Accessibility);
+    g_Accessibility = nullptr;
+}
+
+static void ImGui_ImplWin32_Accessibility_Update()
+{
+    if (g_Accessibility == nullptr)
+        return;
+
+    // Track focus changes
+    ImGuiID currentFocusId = ImGui::GetFocusID();
+    ImGuiWindow* currentFocusWindow = ImGui::GetCurrentWindow();
+    
+    if (currentFocusId != g_Accessibility->FocusedId || currentFocusWindow != g_Accessibility->FocusedWindow)
+    {
+        g_Accessibility->FocusedId = currentFocusId;
+        g_Accessibility->FocusedWindow = currentFocusWindow;
+        
+        // Notify about focus change
+        ImGui_ImplWin32_Accessibility_NotifyEvent(UIA_AutomationFocusChangedEventId, OBJID_CLIENT, CHILDID_SELF);
+    }
+}
+
+static void ImGui_ImplWin32_Accessibility_NotifyEvent(EVENTID eventId, LONG idObject, LONG idChild)
+{
+    if (g_Accessibility == nullptr)
+        return;
+
+    // Simple event notification implementation
+    IUIAutomation* pAutomation = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pAutomation));
+    if (SUCCEEDED(hr))
+    {
+        IUIAutomationElement* pElement = nullptr;
+        hr = pAutomation->ElementFromHandle(g_Accessibility->Window, &pElement);
+        if (SUCCEEDED(hr))
+        {
+            pElement->RaiseAutomationEvent(eventId);
+            pElement->Release();
+        }
+        pAutomation->Release();
+    }
+}
+#endif // #ifndef IMGUI_DISABLE_ACCESSIBILITY
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
