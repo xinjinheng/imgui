@@ -5382,6 +5382,9 @@ void ImGui::NewFrame()
     IM_ASSERT(GImGui != NULL && "No current context. Did you call ImGui::CreateContext() and ImGui::SetCurrentContext() ?");
     ImGuiContext& g = *GImGui;
 
+    // Resilience Framework: Initialize thread-local instances
+    ImGui_ImplResilience_NewFrame();
+
     // Remove pending delete hooks before frame start.
     // This deferred removal avoid issues of removal while iterating the hook vector
     for (int n = g.Hooks.Size - 1; n >= 0; n--)
@@ -5895,6 +5898,12 @@ void ImGui::EndFrame()
     // in the BeginDragDropSource() block of the dragged item, you can submit them from a safe single spot
     // (e.g. end of your item loop, or before EndFrame) by reading payload data.
     // In the typical case, the contents of drag tooltip should be possible to infer solely from payload data.
+
+    // Resilience Framework: Update and execute healing commands
+    ImGuiResilience::Update();
+
+    // Resilience Framework: End frame cleanup
+    ImGui_ImplResilience_EndFrame();
     if (g.DragDropActive && g.DragDropSourceFrameCount + 1 < g.FrameCount && !(g.DragDropSourceFlags & ImGuiDragDropFlags_SourceNoPreviewTooltip))
     {
         g.DragDropWithinSource = true;
@@ -16363,6 +16372,13 @@ void ImGui::ShowMetricsWindow(bool* p_open)
     TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "IMGUI_DEBUG_HIGHLIGHT_ALL_ID_CONFLICTS is enabled.\nMust disable after use! Otherwise Dear ImGui will run slower.\n");
 #endif
 
+    // Resilience Metrics
+    if (TreeNode("Resilience Metrics"))
+    {
+        ImGuiResilience::RenderMetrics();
+        TreePop();
+    }
+
     // Tools
     if (TreeNode("Tools"))
     {
@@ -17971,6 +17987,14 @@ void ImGui::ShowIDStackToolWindow(bool* p_open)
         }
         EndTable();
     }
+
+    // Resilience Metrics
+    if (TreeNode("Resilience Metrics"))
+    {
+        ImGuiResilience::RenderMetrics();
+        TreePop();
+    }
+
     End();
 }
 
